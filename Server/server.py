@@ -69,13 +69,10 @@ DEFAULT_MODE = "screen"
 
 client = genai.Client(http_options={"api_version": "v1beta"})
 
-CONFIG = {"response_modalities": ["AUDIO"]}
-
 pya = pyaudio.PyAudio()
 
 YOUR_SERVER_HOST = "0.0.0.0" 
 YOUR_SERVER_PORT = 8765
-
 
 
 class AudioLoop:
@@ -91,6 +88,7 @@ class AudioLoop:
         self.receive_audio_task = None
         self.play_audio_task = None
         self.debug_wave_file = None
+        self.last_handle = None
 
     async def create_websocket_server(self):
         async with websockets.serve(
@@ -105,6 +103,11 @@ class AudioLoop:
             async with (
                 asyncio.TaskGroup() as tg,
             ):
+                last_handle = client_ws.request.path if client_ws.request else None
+                if(last_handle is not None and last_handle!="/"):
+                    self.last_handle= last_handle[1:]  # remove leading '/'
+                    print(f"handle_client_stream: {client_ws.remote_address}, last_handle: {last_handle}")
+
                 tg.create_task(self.run(client_ws))
 
         except asyncio.CancelledError:
@@ -217,6 +220,7 @@ class AudioLoop:
             await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
 
     async def receive_audio(self):
+        new_handle = None
         "Background task to reads from the websocket and write pcm chunks to the output queue"
         while True:
             turn = self.session.receive()
@@ -226,6 +230,14 @@ class AudioLoop:
                     continue
                 if text := response.text:
                     print(text, end="")
+                if response.session_resumption_update:
+                    new_handle = response.session_resumption_update.new_handle
+                    if new_handle != self.last_handle:
+                        print(f"\nSession handle updated: {new_handle}\n")
+                        self.last_handle = new_handle
+                if response.go_away is not None:
+                    # The connection will soon be terminated
+                    print(response.go_away.time_left)
 
             # If you interrupt the model, it sends a turn_complete.
             # For interruptions to work, we need to stop playback.
@@ -293,7 +305,12 @@ class AudioLoop:
             self.debug_wave_file.setnchannels(CHANNELS)
             self.debug_wave_file.setsampwidth(pya.get_sample_size(FORMAT))
             self.debug_wave_file.setframerate(SEND_SAMPLE_RATE)
-
+            CONFIG = types.LiveConnectConfig.model_validate({
+                "response_modalities": ["AUDIO"],
+                "session_resumption": {
+                    'handle': self.last_handle,
+                }
+            })
             async with (
                 client.aio.live.connect(model=MODEL, config=CONFIG) as session,
                 asyncio.TaskGroup() as tg,
