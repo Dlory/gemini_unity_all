@@ -41,6 +41,8 @@ public class GeminiLiveClient : MonoBehaviour
     private Coroutine playbackCoroutine;
     private Coroutine audioStreamingCoroutine; 
 
+    private string lastHandle= string.Empty;
+
     void Start()
     {
         audioSource = GetComponent<AudioSource>();
@@ -79,7 +81,13 @@ public class GeminiLiveClient : MonoBehaviour
     
     private async void Connect()
     {
-        ws = new WebSocket(serverUrl);
+        var finalUrl= serverUrl;
+        if(string.IsNullOrEmpty(lastHandle)==false)
+        {
+            finalUrl += $"/{lastHandle}";
+        }
+
+        ws = new WebSocket(finalUrl);
 
         ws.OnOpen += () =>
         {
@@ -142,7 +150,7 @@ public class GeminiLiveClient : MonoBehaviour
     }
 
 
-    private void OnMessageReceived(byte[] bytes)
+    private async void OnMessageReceived(byte[] bytes)
     {
         string message = Encoding.UTF8.GetString(bytes);
 
@@ -165,6 +173,22 @@ public class GeminiLiveClient : MonoBehaviour
             {
                 Debug.LogError($"Decode Base64 AudioData Failed: {e.Message}");
             }
+        }
+        else if(type== "update_handle")
+        {
+            lastHandle = content;
+        }
+        else if(type=="reconnect")
+        {
+            float time = 0;
+            if(float.TryParse(content,out time)==false)
+            {
+                time = 0;
+            }
+            await Task.Delay(TimeSpan.FromSeconds(time));
+            await ws.Close();
+            Debug.Log("Server Request Reconnect");
+            Connect();
         }
     }
 
