@@ -47,6 +47,7 @@ import argparse
 import wave
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 import websockets
 
 if sys.version_info < (3, 11, 0):
@@ -64,7 +65,7 @@ RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
 MODEL = "models/gemini-live-2.5-flash-preview"
-
+PDF_FILE_NAME = "knowledge_base.pdf"
 DEFAULT_MODE = "screen"
 
 client = genai.Client(http_options={"api_version": "v1beta"})
@@ -74,6 +75,54 @@ pya = pyaudio.PyAudio()
 YOUR_SERVER_HOST = "0.0.0.0" 
 YOUR_SERVER_PORT = 8765
 
+async def check_and_upload_file(client_async,pdf_file_path,display_name):
+    file_uri=None
+    try:
+        async for uploaded_file in await client_async.files.list():
+            if uploaded_file.display_name ==display_name:
+                print(f"file alreay exist: {uploaded_file.name},{uploaded_file.uri}")
+                file_uri=uploaded_file.uri
+                return file_uri
+        if(file_uri is None):
+            # 1. Asynchronously upload the PDF file and get the file reference (file.name)
+            uploaded_file = await client_async.files.upload(file=pdf_file_path,config={"display_name": display_name})
+            file_uri = uploaded_file.uri
+            print(f"File uploaded successfully. uri: {file_uri}")
+            return file_uri
+    except APIError as e:
+        print(f"File upload failed: {e}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred during file upload: {e}")
+        return False
+
+
+async def setup_live_session_with_pdf_context(
+    live_session,
+    pdf_file_path: str,
+) -> bool:
+    file_part = types.Part.from_uri(file_uri=pdf_file_path, mime_type="application/pdf")
+
+    initial_context_turn = types.Content(
+        role="user",
+        parts=[file_part]
+    )
+
+    print("--- Step 3: Sending context to Live API session ---")
+    try:
+        await live_session.send_client_content(
+            turns=[initial_context_turn],
+            turn_complete=True 
+        )
+        print("Initial PDF knowledge base context successfully sent to Live API.")
+        return True
+
+    except Exception as e:
+        print(f"Failed to send Live API context: {e}")
+        return False
+    finally:
+        pass
+
 
 class AudioLoop:
     def __init__(self, video_mode=DEFAULT_MODE):
@@ -81,7 +130,6 @@ class AudioLoop:
 
         self.audio_in_queue = None
         self.out_queue = None
-
         self.session = None
 
         self.send_text_task = None
@@ -219,7 +267,7 @@ class AudioLoop:
                 await asyncio.to_thread(self.debug_wave_file.writeframes, data)
             await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
 
-    async def receive_audio(self):
+    async def receive_audio(self,client_ws):
         new_handle = None
         "Background task to reads from the websocket and write pcm chunks to the output queue"
         while True:
@@ -235,9 +283,14 @@ class AudioLoop:
                     if new_handle != self.last_handle:
                         print(f"\nSession handle updated: {new_handle}\n")
                         self.last_handle = new_handle
+                        client_ws.send(f'{"type":"update_handle","content":{new_handle}}')
                 if response.go_away is not None:
                     # The connection will soon be terminated
                     print(response.go_away.time_left)
+                    client_ws.send(f'{"type":"reconnect","content":{response.go_away.time_left}}')
+                if response.server_content is not None and response.server_content.generation_complete is True:
+                    # The generation is complete
+                    print("response.server_content.generation_complete")
 
             # If you interrupt the model, it sends a turn_complete.
             # For interruptions to work, we need to stop playback.
@@ -300,6 +353,7 @@ class AudioLoop:
                 pass
 
     async def run(self,client_ws):
+        #SYSTEM_INSTRUCTION = "You are an expert assistant. Please answer all user questions strictly based on the content of the uploaded PDF knowledge document. If the answer is not in the document, say 'I cannot find that information in the provided document.'"
         try:
             self.debug_wave_file = wave.open("client_audio_debug.wav", 'wb')
             self.debug_wave_file.setnchannels(CHANNELS)
@@ -309,14 +363,20 @@ class AudioLoop:
                 "response_modalities": ["AUDIO"],
                 "session_resumption": {
                     'handle': self.last_handle,
-                }
+                },
+                #"system_instruction":SYSTEM_INSTRUCTION
             })
             async with (
                 client.aio.live.connect(model=MODEL, config=CONFIG) as session,
                 asyncio.TaskGroup() as tg,
             ):
                 self.session = session
-
+                # success = await setup_live_session_with_pdf_context(
+                #         live_session=session,
+                #         pdf_file_path="https://storage.googleapis.com/gin_bucket/pdfs/P800R%20V5%20user%20manual%20-V3.2-20231221.pdf"
+                #     )
+                # if not success:
+                #     print("Failed to set up PDF context. Proceeding without knowledge base.")
                 self.audio_in_queue = asyncio.Queue()
                 self.out_queue = asyncio.Queue(maxsize=50)
 
@@ -329,7 +389,7 @@ class AudioLoop:
                 #     tg.create_task(self.get_screen())
 
                 tg.create_task(self.receive_client_message(client_ws))
-                tg.create_task(self.receive_audio())
+                tg.create_task(self.receive_audio(client_ws))
                 tg.create_task(self.play_audio())
 
                 await send_text_task
@@ -338,7 +398,7 @@ class AudioLoop:
         except asyncio.CancelledError:
             pass
         except ExceptionGroup as EG:
-            if(self.audio_stream is not None):
+            if(hasattr(self, 'audio_stream') and self.audio_stream is not None):
                 self.audio_stream.close()
             traceback.print_exception(EG)
         finally:
