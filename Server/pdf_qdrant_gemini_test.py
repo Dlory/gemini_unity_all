@@ -6,6 +6,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import os
 import uuid
 from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder
 # --- 1. Configuration and Initialization ---
 
 gemini_client = genai.Client() 
@@ -20,6 +21,9 @@ collection_name = f"pdf_rag_collection_{PDF_FILE_PATH}"
 vector_size = 768 # Dimension of 'all-mpnet-base-v2'
 
 embed_model  = SentenceTransformer("all-mpnet-base-v2")
+# Load the model for Reranking
+# cross-encoder/ms-marco-MiniLM-L6-v2 is a commonly used reranking model
+reranker_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2')
 
 
 def get_local_embeddings(chunks):
@@ -110,11 +114,27 @@ def rag_query(query: str, client: genai.Client, qdrant_client: QdrantClient):
     search_results = qdrant_client.search(
         collection_name=collection_name,
         query_vector=query_vector,
-        limit=3,
+        limit=20,
     )
-    
-    # 3. Construct RAG prompt
-    context = "\n---\n".join([hit.payload['text'] for hit in search_results])
+    # --- Add Reranking Step ---
+    # 1. Prepare input pairs: [query, document chunk]
+    rerank_pairs = [[query, hit.payload['text']] for hit in search_results]
+
+    # 2. Get Cross-Encoder scores
+    rerank_scores = reranker_model.predict(rerank_pairs)
+
+    # 3. Add scores to results and re-sort
+    for i, hit in enumerate(search_results):
+        hit.score = rerank_scores[i] # Cover or add with new relevance score
+
+    # 4. Sort in descending order based on the new scores
+    reranked_results = sorted(search_results, key=lambda x: x.score, reverse=True)
+
+    # 5. Select Top-N (the final context)
+    final_context_hits = reranked_results[:3] # Only take the top 3 most relevant
+
+    # 3. Construct RAG prompt using the final context
+    context = "\n---\n".join([hit.payload['text'] for hit in final_context_hits])
     
     rag_prompt = f'''
     Please use the following provided context to answer the user's question.
