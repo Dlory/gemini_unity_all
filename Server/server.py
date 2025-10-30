@@ -18,8 +18,10 @@
 
 To install the dependencies for this script, run:
 
-``` 
-pip install google-genai opencv-python pyaudio pillow mss taskgroup
+```
+
+pip install google-genai opencv-python pyaudio pillow mss taskgroup websockets
+
 ```
 
 Before running this script, ensure the `GOOGLE_API_KEY` environment
@@ -27,7 +29,7 @@ variable is set to the api-key you obtained from Google AI Studio.
 
 Important: **Use headphones**. This script uses the system default audio
 input and output, which often won't include echo cancellation. So to prevent
-the model from interrupting itself it is important that you use headphones. 
+the model from interrupting itself it is important that you use headphones.
 
 """
 
@@ -68,24 +70,26 @@ MODEL = "models/gemini-live-2.5-flash-preview"
 PDF_FILE_NAME = "knowledge_base.pdf"
 DEFAULT_MODE = "screen"
 
+# Initialize global client and pyaudio instance
 client = genai.Client(http_options={"api_version": "v1beta"})
-
 pya = pyaudio.PyAudio()
 
-YOUR_SERVER_HOST = "0.0.0.0" 
+YOUR_SERVER_HOST = "0.0.0.0"
 YOUR_SERVER_PORT = 8765
 
-async def check_and_upload_file(client_async,pdf_file_path,display_name):
-    file_uri=None
+# --- File Utility Functions (Remain the same) ---
+
+async def check_and_upload_file(client_async, pdf_file_path, display_name):
+    file_uri = None
     try:
         async for uploaded_file in await client_async.files.list():
-            if uploaded_file.display_name ==display_name:
-                print(f"file alreay exist: {uploaded_file.name},{uploaded_file.uri}")
-                file_uri=uploaded_file.uri
+            if uploaded_file.display_name == display_name:
+                print(f"file already exist: {uploaded_file.name},{uploaded_file.uri}")
+                file_uri = uploaded_file.uri
                 return file_uri
-        if(file_uri is None):
+        if file_uri is None:
             # 1. Asynchronously upload the PDF file and get the file reference (file.name)
-            uploaded_file = await client_async.files.upload(file=pdf_file_path,config={"display_name": display_name})
+            uploaded_file = await client_async.files.upload(file=pdf_file_path, config={"display_name": display_name})
             file_uri = uploaded_file.uri
             print(f"File uploaded successfully. uri: {file_uri}")
             return file_uri
@@ -112,7 +116,7 @@ async def setup_live_session_with_pdf_context(
     try:
         await live_session.send_client_content(
             turns=[initial_context_turn],
-            turn_complete=True 
+            turn_complete=True
         )
         print("Initial PDF knowledge base context successfully sent to Live API.")
         return True
@@ -124,46 +128,27 @@ async def setup_live_session_with_pdf_context(
         pass
 
 
-class AudioLoop:
-    def __init__(self, video_mode=DEFAULT_MODE):
-        self.video_mode = video_mode
+# --- Client Handler Class (New/Refactored) ---
 
-        self.audio_in_queue = None
-        self.out_queue = None
+class ClientHandler:
+    """
+    Handles a single client's websocket connection and Live API session.
+    All state (session, queues, handle) is local to this instance.
+    """
+    def __init__(self, client_ws, initial_handle=None):
+        self.client_ws = client_ws
         self.session = None
 
-        self.send_text_task = None
-        self.receive_audio_task = None
-        self.play_audio_task = None
+        # Queues are specific to this handler instance
+        self.audio_in_queue = asyncio.Queue()  # Queue for audio chunks from Gemini
+        self.out_queue = asyncio.Queue(maxsize=50) # Queue for media/text to Gemini
+        self.current_handle = initial_handle
+
+        # Debug flag/file for client audio (optional)
         self.debug_wave_file = None
-        self.last_handle = None
-
-    async def create_websocket_server(self):
-        async with websockets.serve(
-            self.handle_client_stream, YOUR_SERVER_HOST, YOUR_SERVER_PORT
-        ):
-            print(f"websocket server started，address: ws://{YOUR_SERVER_HOST}:{YOUR_SERVER_PORT}")
-            print(f"wait for client's connect...")
-            await asyncio.Future()
-
-    async def handle_client_stream(self, client_ws, *args):
-        try:
-            async with (
-                asyncio.TaskGroup() as tg,
-            ):
-                last_handle = client_ws.request.path if client_ws.request else None
-                if(last_handle is not None and last_handle!="/"):
-                    self.last_handle= last_handle[1:]  # remove leading '/'
-                    print(f"handle_client_stream: {client_ws.remote_address}, last_handle: {last_handle}")
-
-                tg.create_task(self.run(client_ws))
-
-        except asyncio.CancelledError:
-            pass
-        except ExceptionGroup as EG:
-            traceback.print_exception(EG)
 
     async def send_text(self):
+        """Allows server admin to send text via console."""
         while True:
             text = await asyncio.to_thread(
                 input,
@@ -171,135 +156,103 @@ class AudioLoop:
             )
             if text.lower() == "q":
                 break
+            # Send message to the current client's session
             await self.session.send(input=text or ".", end_of_turn=True)
 
-    def _get_frame(self, cap):
-        # Read the frameq
-        ret, frame = cap.read()
-        # Check if the frame was read successfully
-        if not ret:
-            return None
-        # Fix: Convert BGR to RGB color space
-        # OpenCV captures in BGR but PIL expects RGB format
-        # This prevents the blue tint in the video feed
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = PIL.Image.fromarray(frame_rgb)  # Now using RGB frame
-        img.thumbnail([1024, 1024])
-
-        image_io = io.BytesIO()
-        img.save(image_io, format="jpeg")
-        image_io.seek(0)
-
-        mime_type = "image/jpeg"
-        image_bytes = image_io.read()
-        return {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}
-
-    async def get_frames(self):
-        # This takes about a second, and will block the whole program
-        # causing the audio pipeline to overflow if you don't to_thread it.
-        cap = await asyncio.to_thread(
-            cv2.VideoCapture, 0
-        )  # 0 represents the default camera
-
-        while True:
-            frame = await asyncio.to_thread(self._get_frame, cap)
-            if frame is None:
-                break
-
-            await asyncio.sleep(1.0)
-
-            await self.out_queue.put(frame)
-
-        # Release the VideoCapture object
-        cap.release()
-
-    def _get_screen(self):
-        sct = mss.mss()
-        monitor = sct.monitors[0]
-
-        i = sct.grab(monitor)
-
-        mime_type = "image/jpeg"
-        image_bytes = mss.tools.to_png(i.rgb, i.size)
-        img = PIL.Image.open(io.BytesIO(image_bytes))
-
-        image_io = io.BytesIO()
-        img.save(image_io, format="jpeg")
-        image_io.seek(0)
-
-        image_bytes = image_io.read()
-        return {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}
-
-    async def get_screen(self):
-
-        while True:
-            frame = await asyncio.to_thread(self._get_screen)
-            if frame is None:
-                break
-
-            await asyncio.sleep(1.0)
-
-            await self.out_queue.put(frame)
-
     async def send_realtime(self):
+        """Forwards media/image data from client queue to Gemini session."""
         while True:
+            # Waits for media from receive_client_message
             msg = await self.out_queue.get()
             await self.session.send(input=msg)
 
-    async def listen_audio(self):
-        mic_info = pya.get_default_input_device_info()
-        self.audio_stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=SEND_SAMPLE_RATE,
-            input=True,
-            input_device_index=mic_info["index"],
-            frames_per_buffer=CHUNK_SIZE,
-        )
-        if __debug__:
-            kwargs = {"exception_on_overflow": False}
-        else:
-            kwargs = {}
-        while True:
-            data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-            if self.debug_wave_file:
-                await asyncio.to_thread(self.debug_wave_file.writeframes, data)
-            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+    async def receive_client_message(self):
+        """Reads messages (audio, image, text) from the client websocket."""
+        try:
+            async for message in self.client_ws:
+                if isinstance(message, bytes):
+                    # Raw audio data from client
+                    await self.session.send_realtime_input(media=types.Blob(data=message, mime_type="audio/pcm"))
 
-    async def receive_audio(self,client_ws):
-        new_handle = None
-        "Background task to reads from the websocket and write pcm chunks to the output queue"
+                elif isinstance(message, str):
+                    # JSON message from client (text or image metadata)
+                    try:
+                        data = json.loads(message)
+                        data_type = data.get('type')
+
+                        if data_type == 'image':
+                            # Client sent an image base64 string
+                            image_data = base64.b64decode(data['data'])
+                            img = PIL.Image.open(io.BytesIO(image_data))
+
+                            # Save image locally for debug
+                            img.save(f"debug_screen_{self.client_ws.remote_address[1]}.jpg", format="JPEG")
+
+                            image_io = io.BytesIO()
+                            img.save(image_io, format="jpeg")
+                            image_io.seek(0)
+
+                            image_bytes = image_io.read()
+
+                            # Put image into out_queue to be sent by send_realtime
+                            #await self.out_queue.put({"data": image_bytes, "mime_type": "image/jpeg"})
+                            await self.session.send_realtime_input(media=types.Blob(data=image_bytes, mime_type="image/jpeg"))
+
+                        elif data_type == 'text':
+                            # Client sent text message
+                            await self.session.send_client_content(
+                                turns={"role": "user", "parts": [{"text": data['content']}]}, turn_complete=True
+                            )
+
+                    except json.JSONDecodeError:
+                        print(f"Client {self.client_ws.remote_address} sent invalid json message.")
+
+        except websockets.exceptions.ConnectionClosed:
+            print(f"Client {self.client_ws.remote_address} disconnected.")
+        except Exception as e:
+            print(f"receive_client_message error for {self.client_ws.remote_address}: {e}")
+        finally:
+            # Raise CancelledError to shut down other tasks in the group gracefully
+            raise asyncio.CancelledError("Client disconnected or error occurred.")
+
+
+    async def receive_audio(self):
+        """Reads responses from the Live API session and handles audio/text/updates."""
         while True:
             turn = self.session.receive()
             async for response in turn:
                 if data := response.data:
+                    # Received audio chunk
                     self.audio_in_queue.put_nowait(data)
                     continue
                 if text := response.text:
-                    print(text, end="")
+                    # Received text response (streaming)
+                    print(f"[{self.client_ws.remote_address[1]}] {text}", end="", flush=True)
+
                 if response.session_resumption_update:
+                    # Session handle updated
                     new_handle = response.session_resumption_update.new_handle
-                    if new_handle != self.last_handle:
-                        print(f"\nSession handle updated: {new_handle}\n")
-                        self.last_handle = new_handle
-                        client_ws.send(f'{"type":"update_handle","content":{new_handle}}')
+                    if new_handle != self.current_handle:
+                        print(f"\n[{self.client_ws.remote_address[1]}] Session handle updated: {new_handle}\n")
+                        self.current_handle = new_handle
+                        # Notify client of the new handle (client must implement receiving this)
+                        await self.client_ws.send(json.dumps({"type": "update_handle", "content": new_handle}))
+
                 if response.go_away is not None:
-                    # The connection will soon be terminated
-                    print(response.go_away.time_left)
-                    client_ws.send(f'{"type":"reconnect","content":{response.go_away.time_left}}')
+                    # The connection will soon be terminated by the server
+                    print(f"\n[{self.client_ws.remote_address[1]}] Live API connection closing in {response.go_away.time_left}s.")
+                    await self.client_ws.send(json.dumps({"type": "reconnect", "content": response.go_away.time_left}))
                 if response.server_content is not None and response.server_content.generation_complete is True:
                     # The generation is complete
-                    print("response.server_content.generation_complete")
+                    print(f"[{self.client_ws.remote_address[1]}] Generation complete.")
 
-            # If you interrupt the model, it sends a turn_complete.
-            # For interruptions to work, we need to stop playback.
-            # So empty out the audio queue because it may have loaded
-            # much more audio than has played yet.
+
+            # If an interruption occurs (turn_complete is sent), we empty the audio queue
             while not self.audio_in_queue.empty():
                 self.audio_in_queue.get_nowait()
 
     async def play_audio(self):
+        """Plays audio chunks received from the Live API session."""
         stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
@@ -312,57 +265,14 @@ class AudioLoop:
             await asyncio.to_thread(stream.write, bytestream)
 
 
-    async def receive_client_message(self, client_ws):
-            try:
-                async for message in client_ws:
-                    if isinstance(message, bytes):
-                        #  if self.debug_wave_file:
-                        #     await asyncio.to_thread(self.debug_wave_file.writeframes, message)
-                        await self.session.send_realtime_input(media=types.Blob(data=message, mime_type="audio/pcm"))
-                        
-                    elif isinstance(message, str):
-                        try:
-                            data = json.loads(message)
-                            data_type = data.get('type')
-                            
-                            if data_type == 'image':
-                                image_data = base64.b64decode(data['data'])
-                                img = PIL.Image.open(io.BytesIO(image_data))
-
-                                # Save image locally for debug
-                                img.save("debug_screen.jpg", format="JPEG")
-
-                                image_io = io.BytesIO()
-                                img.save(image_io, format="jpeg")
-                                image_io.seek(0)
-
-                                image_bytes = image_io.read()
-
-                                await self.out_queue.put({"data": image_bytes, "mime_type": "image/jpeg"})
-                            elif data_type == 'text':
-                                await self.session.send(input=data['content'] or ".", end_of_turn=True)
-                                
-                        except json.JSONDecodeError:
-                            print("invalid json message received from client")
-                            
-            except websockets.exceptions.ConnectionClosed:
-                print("client disconnected")
-            except Exception as e:
-                print(f"receive_client_message error: {e}")
-            finally:
-                pass
-
-    async def run(self,client_ws):
-        #SYSTEM_INSTRUCTION = "You are an expert assistant. Please answer all user questions strictly based on the content of the uploaded PDF knowledge document. If the answer is not in the document, say 'I cannot find that information in the provided document.'"
+    async def run(self):
+        """Initializes and runs the Gemini Live API session for this client."""
+        # SYSTEM_INSTRUCTION = "You are an expert assistant. Please answer all user questions strictly based on the content of the uploaded PDF knowledge document. If the answer is not in the document, say 'I cannot find that information in the provided document.'"
         try:
-            self.debug_wave_file = wave.open("client_audio_debug.wav", 'wb')
-            self.debug_wave_file.setnchannels(CHANNELS)
-            self.debug_wave_file.setsampwidth(pya.get_sample_size(FORMAT))
-            self.debug_wave_file.setframerate(SEND_SAMPLE_RATE)
             CONFIG = types.LiveConnectConfig.model_validate({
                 "response_modalities": ["AUDIO"],
                 "session_resumption": {
-                    'handle': self.last_handle,
+                    'handle': self.current_handle, # Use the handle specific to this client
                 },
                 #"system_instruction":SYSTEM_INSTRUCTION
             })
@@ -370,41 +280,82 @@ class AudioLoop:
                 client.aio.live.connect(model=MODEL, config=CONFIG) as session,
                 asyncio.TaskGroup() as tg,
             ):
-                self.session = session
+                self.session = session # This session is local to the ClientHandler instance
+
+                # Optional: Send PDF context (example is commented out)
                 # success = await setup_live_session_with_pdf_context(
                 #         live_session=session,
                 #         pdf_file_path="https://storage.googleapis.com/gin_bucket/pdfs/P800R%20V5%20user%20manual%20-V3.2-20231221.pdf"
                 #     )
                 # if not success:
                 #     print("Failed to set up PDF context. Proceeding without knowledge base.")
-                self.audio_in_queue = asyncio.Queue()
-                self.out_queue = asyncio.Queue(maxsize=50)
 
-                send_text_task = tg.create_task(self.send_text())
+                # Start the tasks for this client's session
                 tg.create_task(self.send_realtime())
-                #tg.create_task(self.listen_audio())
-                # if self.video_mode == "camera":
-                #     tg.create_task(self.get_frames())
-                # elif self.video_mode == "screen":
-                #     tg.create_task(self.get_screen())
-
-                tg.create_task(self.receive_client_message(client_ws))
-                tg.create_task(self.receive_audio(client_ws))
+                tg.create_task(self.receive_client_message())
+                tg.create_task(self.receive_audio())
                 tg.create_task(self.play_audio())
 
-                await send_text_task
-                raise asyncio.CancelledError("User requested exit")
+                # Task for server admin text input (optional)
+                admin_task = tg.create_task(self.send_text())
+                await admin_task
+                raise asyncio.CancelledError("Admin requested exit") # If admin exits, close all connections
 
         except asyncio.CancelledError:
             pass
         except ExceptionGroup as EG:
-            if(hasattr(self, 'audio_stream') and self.audio_stream is not None):
-                self.audio_stream.close()
             traceback.print_exception(EG)
         finally:
             if self.debug_wave_file:
                 self.debug_wave_file.close()
 
+
+# --- Server Manager Class (Replaces original AudioLoop's server role) ---
+
+class ServerManager:
+    """Manages the overall websocket server and spawns ClientHandlers."""
+    def __init__(self, video_mode):
+        self.video_mode = video_mode
+        self.active_handlers = {}
+
+    async def handle_client_stream(self, client_ws, *args):
+        """Called by websockets.serve for every new client connection."""
+        client_address = client_ws.remote_address
+        # Get session handle from the path if provided (e.g., ws://host:port/handle_xyz)
+        path_handle = client_ws.request.path[1:] if client_ws.request and client_ws.request.path else None
+
+        print(f"New client connected: {client_address}, initial handle: {path_handle or 'None'}")
+
+        # 1. Create a new, independent handler for THIS client
+        handler = ClientHandler(client_ws, initial_handle=path_handle)
+        self.active_handlers[client_address] = handler
+
+        try:
+            # 2. Run the client's session logic
+            await handler.run()
+        except asyncio.CancelledError:
+            # This is the expected way to exit on client disconnect or admin exit
+            pass
+        except Exception as e:
+            print(f"An error occurred in ClientHandler for {client_address}: {e}")
+            traceback.print_exc()
+        finally:
+            # 3. Clean up when the client disconnects
+            if client_address in self.active_handlers:
+                del self.active_handlers[client_address]
+            print(f"Client disconnected and handler cleaned up: {client_address}")
+
+    async def create_websocket_server(self):
+        """Starts the main websocket server."""
+        async with websockets.serve(
+            self.handle_client_stream, YOUR_SERVER_HOST, YOUR_SERVER_PORT
+        ):
+            print(f"WebSocket server started, address: ws://{YOUR_SERVER_HOST}:{YOUR_SERVER_PORT}")
+            print(f"Wait for client's connect...")
+            await asyncio.Future()
+
+
+# --- Main Execution ---
 
 async def main():
     # Parse arguments
@@ -413,18 +364,23 @@ async def main():
         "--mode",
         type=str,
         default=DEFAULT_MODE,
-        help="pixels to stream from",
+        help="pixels to stream from (Note: Client-side streaming is currently implemented)",
         choices=["camera", "screen", "none"],
     )
     args = parser.parse_args()
 
-    # Create the AudioLoop instance
-    main_instance = AudioLoop(video_mode=args.mode)
+    # Create the ServerManager instance
+    server_manager = ServerManager(video_mode=args.mode)
 
     # Use asyncio TaskGroup to run both tasks concurrently
     async with asyncio.TaskGroup() as tg:
-        tg.create_task(main_instance.create_websocket_server())  # Run websocket server
+        tg.create_task(server_manager.create_websocket_server())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())  # Start the main function
+    try:
+        asyncio.run(main())  # Start the main function
+    except KeyboardInterrupt:
+        print("Server shutdown by user.")
+    except Exception as e:
+        print(f"Fatal error: {e}")
