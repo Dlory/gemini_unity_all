@@ -172,7 +172,7 @@ class ClientHandler:
             async for message in self.client_ws:
                 if isinstance(message, bytes):
                     # Raw audio data from client
-                    await self.session.send_realtime_input(media=types.Blob(data=message, mime_type="audio/pcm"))
+                    await self.session.send_realtime_input(audio=types.Blob(data=message, mime_type="audio/pcm"))
 
                 elif isinstance(message, str):
                     # JSON message from client (text or image metadata)
