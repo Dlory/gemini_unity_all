@@ -195,8 +195,8 @@ class ClientHandler:
                             image_bytes = image_io.read()
 
                             # Put image into out_queue to be sent by send_realtime
-                            #await self.out_queue.put({"data": image_bytes, "mime_type": "image/jpeg"})
-                            await self.session.send_realtime_input(media=types.Blob(data=image_bytes, mime_type="image/jpeg"))
+                            await self.out_queue.put({"data": image_bytes, "mime_type": "image/jpeg"})
+                            #await self.session.send_realtime_input(media=types.Blob(data=image_bytes, mime_type="image/jpeg"))
 
                         elif data_type == 'text':
                             # Client sent text message
