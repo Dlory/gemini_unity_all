@@ -1,3 +1,7 @@
+"""
+pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu118
+pip install qdrant-client pypdf langchain-text-splitters sentence-transformers
+"""
 import google.genai as genai
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
